@@ -1,0 +1,9 @@
+# 默认忽略的文件
+/shelf/
+/workspace.xml
+# JetBrains IDE 配置文件
+.idea/
+*.iml
+*.iws
+*.ipr
+out/
