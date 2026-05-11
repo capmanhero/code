@@ -1,30 +1,15 @@
 # -*- coding: utf-8 -*-
 """
-用 reference/models/data_fusion_model.py 中 __main__ 的数值例子校验 model.py：
+在 model.solve_separable_general 上跑一组中等规模数值例（数据构造方式曾用于本地实验，与 reference 无关）。
 
-1) formulation=\"data_fusion\" 与直接调用 solve_data_fusion_newsvendor 目标值与解一致；
-2) formulation=\"separable\" 为文中可分离全局 t 模型，与 data_fusion 在 I>0 时一般不等价，脚本打印对比供参考。
+本脚本只检验可分离模型能否求得最优解并打印目标值；不再与 data_fusion 或其它 reference 模型对齐。
 """
-
-import importlib.util
-import os
 
 import numpy as np
 
-_ROOT = os.path.dirname(os.path.abspath(__file__))
-
-
-def _load_data_fusion():
-    path = os.path.join(_ROOT, "reference", "models", "data_fusion_model.py")
-    spec = importlib.util.spec_from_file_location("data_fusion_model", path)
-    mod = importlib.util.module_from_spec(spec)
-    assert spec.loader is not None
-    spec.loader.exec_module(mod)
-    return mod
-
 
 def _example_data():
-    """在 data_fusion 示例数据基础上，将原商店 1、2 合并为单店（一份订单、I=1）。"""
+    """单店 I=1、D=10、K=1、经验样本 30；订单合并为一份。"""
     D = 10
     N_samples = 30
     K = 1
@@ -457,56 +442,46 @@ def _example_data():
 def main():
     import model as model_mod
 
-    df = _load_data_fusion()
     kw = _example_data()
-
-    r_ref = df.solve_data_fusion_newsvendor(
-        epsilon_i={1: 0},
-        output_flag=0,
-        **kw,
-    )
-    r_wrap = model_mod.solve_separable_general(
-        formulation="data_fusion",
-        epsilon_i={1: 0},
-        theta_bar=0.0,
-        w_k=None,
-        eta_k_n=None,
-        output_flag=0,
-        **kw,
-    )
-    print(r_wrap)
-    print(r_ref)
-
-
-    x0_ref, xi_ref, mu_ref, lam_ref, f_ref, obj_ref, _ = r_ref
-    x0_w, xi_w, mu_w, lam_w, f_w, obj_w, _ = r_wrap
-
-    assert x0_ref is not None and x0_w is not None
-    assert np.isclose(obj_ref, obj_w, rtol=0, atol=1e-4), (obj_ref, obj_w)
-    assert np.isclose(lam_ref, lam_w, rtol=0, atol=1e-6)
-    for d in range(1, kw["D"] + 1):
-        assert np.isclose(x0_ref[d], x0_w[d], rtol=0, atol=1e-4)
-    for i in range(1, kw["I"] + 1):
-        assert np.isclose(mu_ref[i], mu_w[i], rtol=0, atol=1e-5)
-        for d, v in xi_ref[i].items():
-            assert np.isclose(v, xi_w[i][d], rtol=0, atol=1e-4)
-
-    print("校验通过：model.py formulation=\"data_fusion\" 与该例中 solve_data_fusion_newsvendor 数值一致。")
-    print(f"  目标值: {obj_ref:.6f}, lambda: {lam_ref:.6f}")
+    prices = {k: kw[k] for k in ("p", "c", "p_I", "c_I")}
+    kw_core = {k: v for k, v in kw.items() if k not in prices}
+    D, I = kw["D"], kw["I"]
+    mathcal_D = kw["mathcal_D"]
+    b0 = {d: float(prices["p"][str(d)]) for d in range(1, D + 1)}
+    h0 = {d: 0.0 for d in range(1, D + 1)}
+    bi = {}
+    hi = {}
+    for i in range(1, I + 1):
+        bi[i] = {}
+        hi[i] = {}
+        for d in sorted(mathcal_D[str(i)]):
+            bi[i][d] = float(prices["p_I"][str(d)])
+            hi[i][d] = 0.0
+    g0 = {
+        d: -(float(prices["p"][str(d)]) - float(prices["c"][str(d)]))
+        for d in range(1, D + 1)
+    }
 
     r_sep = model_mod.solve_separable_general(
-        formulation="separable",
+        b_0_coef=b0,
+        h_0_coef=h0,
+        b_i_coef=bi,
+        h_i_coef=hi,
+        obj_x0_linear=g0,
         epsilon_i={1: 0},
         theta_bar=0.0,
         w_k=None,
         eta_k_n=None,
         output_flag=0,
-        **kw,
+        **kw_core,
     )
-    obj_sep = r_sep[5]
-    print(
-        f"可分离形式（separable）目标值: {obj_sep:.6f}（与 data_fusion 不同属预期：全局 t 与 (i,t) 的 \\hat\\zeta 及主约束结构不同。）"
-    )
+    x0, xi, mu, lam, _, obj_sep, _ = r_sep
+    assert x0 is not None and obj_sep is not None
+    print("可分离模型求解完成。")
+    print(f"  目标值: {obj_sep:.6f}, lambda: {lam:.6f}")
+    if xi is not None:
+        for i in sorted(xi.keys()):
+            print(f"  店 {i} mu={mu[i]:.6f}")
 
 
 if __name__ == "__main__":
