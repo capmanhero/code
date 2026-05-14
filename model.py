@@ -10,6 +10,9 @@
          + ∑_{i} ε_i μ_i
          + ∑_{d} g_d x_{0,d}        （可选，由 obj_x0_linear 给出）
 
+另见 ``solve_multi_reference_l1_only``：多源 L1 半径向量 ``(θ_k)_{k∈[K]}``、各源独立 ``λ_k``，
+且 ``∑_d ω_{α,d} ≤ ∑_k f_{k,α_k}``（推论 ``eq:l1-multi-source-only``）。
+
 s.t. (x_i, μ_i) ∈ \\bar{X}_i, λ ≥ 0, f, ω_{α,d}，
      ∑_d ω_{α,d} ≤ ∑_k w_k f_{k,α_k}  ∀α ∈ A，
      以及正文中的 b,h 与 y,y' 线性化约束。
@@ -24,11 +27,422 @@ s.t. (x_i, μ_i) ∈ \\bar{X}_i, λ ≥ 0, f, ω_{α,d}，
 from __future__ import annotations
 
 from itertools import product as itertools_product
-from typing import Any, Dict, List, Mapping, Optional, Sequence, Tuple
+from typing import Any, Dict, List, Mapping, Optional, Sequence, Tuple, Union
 
 import numpy as np
 import gurobipy as gp
-from gurobipy import GRB
+from gurobipy import GRB, quicksum
+
+
+def _wasserstein1_barycenter_lp(
+    C: np.ndarray,
+    dists: List[np.ndarray],
+    w: np.ndarray,
+    output_flag: int,
+) -> Dict[str, Any]:
+    """在已知代价矩阵 C 上解加权 W_1 离散重心 LP（C[i,j]=c(i,j)）。"""
+    n = int(C.shape[0])
+    K = len(dists)
+    for k, p in enumerate(dists):
+        if p.shape != (n,):
+            raise ValueError(f"第 {k} 个概率向量长度须为 n={n}")
+        if not np.isclose(p.sum(), 1.0, atol=1e-6):
+            raise ValueError(f"第 {k} 个概率向量之和须为 1")
+        if (p < -1e-12).any():
+            raise ValueError(f"第 {k} 个概率向量须非负")
+
+    model = gp.Model("W1_Barycenter_K_Discrete")
+    model.setParam("OutputFlag", output_flag)
+
+    b = model.addVars(n, lb=0.0, name="barycenter")
+    Ts: List[Any] = []
+    for k in range(K):
+        Ts.append(model.addVars(n, n, lb=0.0, name=f"T_{k}"))
+
+    obj = quicksum(
+        float(w[k]) * quicksum(float(C[i, j]) * Ts[k][i, j] for i in range(n) for j in range(n))
+        for k in range(K)
+    )
+    model.setObjective(obj, GRB.MINIMIZE)
+
+    model.addConstr(quicksum(b[i] for i in range(n)) == 1, "barycenter_sum")
+
+    for i in range(n):
+        for k in range(K):
+            model.addConstr(quicksum(Ts[k][i, j] for j in range(n)) == b[i], f"T{k}_row_{i}")
+
+    for j in range(n):
+        for k in range(K):
+            model.addConstr(
+                quicksum(Ts[k][i, j] for i in range(n)) == float(dists[k][j]),
+                f"T{k}_col_{j}",
+            )
+
+    model.optimize()
+    if model.Status != GRB.OPTIMAL:
+        raise RuntimeError(f"W1 重心求解未得到最优解，Gurobi 状态码 {model.Status}")
+
+    bary = np.array([b[i].X for i in range(n)], dtype=float)
+    T_mats = tuple(
+        np.array([[Ts[k][i, j].X for j in range(n)] for i in range(n)], dtype=float)
+        for k in range(K)
+    )
+    w1_dists = np.array([float(np.sum(C * T_mats[k])) for k in range(K)], dtype=float)
+    return {
+        "barycenter": bary,
+        "objective_value": float(model.ObjVal),
+        "transport_matrices": T_mats,
+        "wasserstein1_distances": w1_dists,
+        "n_points": n,
+        "K": K,
+        "weights": w.copy(),
+    }
+
+
+def _grid_row_key(row: np.ndarray, decimals: int = 10) -> Tuple[float, ...]:
+    return tuple(np.round(row, decimals))
+
+
+def _cartesian_product_grid_from_samples(
+    sample_arrays: List[np.ndarray],
+) -> Tuple[np.ndarray, List[np.ndarray]]:
+    """
+    对每个维度 d，取所有样本在该维出现过的取值之并（唯一化），再作笛卡尔积作为网格行。
+    """
+    if not sample_arrays:
+        raise ValueError("至少需要一组经验样本")
+    D = int(sample_arrays[0].shape[1])
+    if D < 1:
+        raise ValueError("维度 D 须至少为 1")
+    for a in sample_arrays:
+        if len(a.shape) != 2 or int(a.shape[1]) != D:
+            raise ValueError("各经验分布须为二维数组 (n_k, D) 且 D 一致")
+        if a.shape[0] < 1:
+            raise ValueError("每组经验分布至少含一个样本点")
+
+    per_dim: List[np.ndarray] = []
+    for d in range(D):
+        cols = [a[:, d] for a in sample_arrays]
+        per_dim.append(np.unique(np.concatenate(cols)))
+
+    grid_tuples = list(itertools_product(*[v.tolist() for v in per_dim]))
+    X = np.asarray(grid_tuples, dtype=float)
+    return X, per_dim
+
+
+def _embed_empirical_on_grid(
+    samples: np.ndarray,
+    X: np.ndarray,
+    row_masses: Optional[np.ndarray] = None,
+    decimals: int = 10,
+) -> np.ndarray:
+    """
+    将离散经验分布嵌入网格 X 上的概率向量：第 i 行样本携带质量 m_i，同网格点质量相加。
+
+    row_masses 为 None 时等价于 inverse_refined_mr_DRO 中 eta_k_n 缺省：m_i = 1/n_k。
+    """
+    n = X.shape[0]
+    idx_map = {_grid_row_key(X[i], decimals): i for i in range(n)}
+    p = np.zeros(n, dtype=float)
+    nk = int(samples.shape[0])
+    if row_masses is None:
+        m = np.ones(nk, dtype=float) / nk
+    else:
+        m = np.asarray(row_masses, dtype=float).ravel()
+        if m.size != nk:
+            raise ValueError(f"质量向量长度须等于样本行数 n_k={nk}，当前为 {m.size}")
+        if (m < -1e-12).any():
+            raise ValueError("样本质量须非负")
+        if not np.isclose(m.sum(), 1.0, atol=1e-6):
+            raise ValueError(f"样本质量之和须为 1，当前为 {m.sum():.6f}")
+
+    for i in range(nk):
+        row = samples[i]
+        mass = float(m[i])
+        key = _grid_row_key(row, decimals)
+        if key in idx_map:
+            p[idx_map[key]] += mass
+            continue
+        matched = None
+        for j in range(n):
+            if np.allclose(X[j], row, rtol=0.0, atol=1e-8):
+                matched = j
+                break
+        if matched is None:
+            raise ValueError(
+                f"样本行无法匹配到积网格（请检查数值或是否由各维观测值生成）: {row!r}"
+            )
+        p[matched] += mass
+    return p
+
+
+def wasserstein1_barycenter_k_discrete(
+    empirical_distributions: Mapping[int, np.ndarray],
+    weights: Optional[Union[np.ndarray, Mapping[int, float]]] = None,
+    eta_k_n: Optional[Mapping[int, np.ndarray]] = None,
+    output_flag: int = 0,
+) -> Dict[str, Any]:
+    """
+    在「各维支撑之并」的笛卡尔积网格上，求加权 1-Wasserstein（L1 地面度量）离散重心。
+
+    输入为 inverse_refined_mr_DRO 风格的 ``{k: 样本矩阵 (n_k, D)}``；每个 k 上经验律取
+    样本行上的离散分布，再嵌入到公共网格：第 d 维取所有经验样本在该维出现过的值的集合
+    S_d，网格点为 ``S_1 × … × S_D``（与题设 (1,3),(2,4) → {(1,3),(1,4),(2,3),(2,4)} 一致）。
+
+    **是否「精确」Wasserstein 重心？**
+    - 在 **全空间** \\mathbb{R}^D 上不限制支撑时，W_1 的 Fréchet 均值一般 **不是**
+      有限点集上的测度，更无法用该笛卡尔积 **精确** 表示；网格上的解是 **限制重心支撑在该积网格上**
+      时的 LP **精确最优**（对该离散化问题零对偶间隙意义下的精确）。
+    - 若问题本意就是「在所有网格点上选 b 使 sum_k w_k W_1(b, \\hat P_k) 最小」，则本构造给出该问题的精确解。
+
+    参数:
+        empirical_distributions: 键为 k、值为 (n_k, D) 的样本矩阵（与 inverse_refined_mr_DRO 一致）。
+        weights: 与 ``sorted(keys)`` 同序的长度 K 向量，或 ``{k: w_k}`` 字典（和为 1）；默认等权。
+        eta_k_n: 可选，与 inverse_refined_mr_DRO 中 ``eta_k_n`` 含义一致：``eta_k_n[k]`` 为长度 n_k、
+            非负且和为 1 的向量，``eta_k_n[k][i]`` 为第 k 个分布第 i 行样本的质量。
+            为 ``None`` 时退化为 ``np.ones(n_k) / n_k``（行等权）。
+            若传入字典，须对 ``sorted(empirical_distributions.keys())`` 中每个 k 都给出条目。
+        output_flag: Gurobi OutputFlag。
+
+    返回:
+        dict：含 ``X``（积网格 n×D）、``per_dimension_support``、``keys_order``、
+        ``barycenter``（与 X 行对齐）、``objective_value``、``transport_matrices``、
+        ``wasserstein1_distances``、``dimension``、``K``、``weights``。
+        网格点数 n = prod_d |S_d|，维数 D 大时指数级增长。
+    """
+    keys = sorted(empirical_distributions.keys())
+    K = len(keys)
+    if K < 1:
+        raise ValueError("至少需要 1 个经验分布")
+
+    arrs = [np.asarray(empirical_distributions[t], dtype=float) for t in keys]
+    X, per_dim = _cartesian_product_grid_from_samples(arrs)
+    n, D = int(X.shape[0]), int(X.shape[1])
+
+    if weights is None:
+        w = np.ones(K, dtype=float) / K
+    elif isinstance(weights, Mapping):
+        w = np.array([float(weights[t]) for t in keys], dtype=float)
+        if w.shape != (K,):
+            raise ValueError("weights 字典须对每个经验键 k 给出一个权重")
+        if not np.isclose(w.sum(), 1.0, atol=1e-6):
+            raise ValueError(f"权重之和须为 1，当前为 {w.sum():.6f}")
+    else:
+        w = np.asarray(weights, dtype=float).ravel()
+        if w.size != K:
+            raise ValueError(f"weights 长度须为 K={K}（与 sorted(keys) 一致）")
+        if not np.isclose(w.sum(), 1.0, atol=1e-6):
+            raise ValueError(f"权重之和须为 1，当前为 {w.sum():.6f}")
+
+    if eta_k_n is None:
+        row_weights_per_k: List[Optional[np.ndarray]] = [None] * K
+    else:
+        row_weights_per_k = []
+        for t in keys:
+            if t not in eta_k_n:
+                raise ValueError(
+                    f"提供 eta_k_n 时须包含每个经验键 k 的质量向量，缺少键 {t!r}"
+                )
+            eta = np.asarray(eta_k_n[t], dtype=float)
+            row_weights_per_k.append(eta)
+
+    dist_vecs = [
+        _embed_empirical_on_grid(a, X, row_masses=rw)
+        for a, rw in zip(arrs, row_weights_per_k)
+    ]
+    C = np.abs(X[:, None, :] - X[None, :, :]).sum(axis=-1)
+
+    out = _wasserstein1_barycenter_lp(C, dist_vecs, w, output_flag)
+    out["X"] = X
+    out["per_dimension_support"] = per_dim
+    out["keys_order"] = keys
+    out["dimension"] = D
+    return out
+
+
+def solve_multi_reference_l1_only(
+    empirical_distributions: Mapping[int, np.ndarray],
+    theta_k: Mapping[int, float],
+    Xi: Mapping,
+    A_0: Sequence[Sequence[float]],
+    b_0: Sequence[float],
+    b_0_coef: Mapping[int, float],
+    h_0_coef: Mapping[int, float],
+    obj_x0_linear: Optional[Mapping[int, float]] = None,
+    eta_k_n: Optional[Mapping[int, np.ndarray]] = None,
+    output_flag: int = 0,
+) -> Tuple[
+    Optional[Dict[int, float]],
+    Optional[Dict[int, float]],
+    Optional[Dict[int, List[float]]],
+    float,
+    Any,
+]:
+    """
+    推论 ``coro:finite convex reduction--multi_references_l1``（仅多源经验、L1 地面度量）：
+
+        inf  ∑_{k,n} η_{k,n} f_{k,n} + ∑_{k} λ_k θ_k
+        s.t. λ_k ≥ 0, f_{k,n}, ω_{α,d} ∈ ℝ,
+             ∑_d ω_{α,d} ≤ ∑_{k} f_{k,α_k}   ∀α ∈ A = ∏_k [N_k],
+             b_{0,d} y_{t,α,d} + h_{0,d} y'_{t,α,d}
+                 − ∑_{k} λ_k |\\hat{ζ}_{t,α,d} − \\hat{ξ}_{k,α_k,d}|
+                 ≤ ω_{α,d}
+             y_{t,α,d} ≥ \\hat{ζ}_{t,α,d} − x_{0,d},
+             y'_{t,α,d} ≥ x_{0,d} − \\hat{ζ}_{t,α,d}
+             ∀α, d, t ∈ [K+2].
+
+    其中 \\hat{ζ}_{t,α,d} 在 t∈[K] 为 \\hat{ξ}_{t,α_t,d}，t=K+1 为 \\underline{Ξ}_d，t=K+2 为 \\overline{Ξ}_d。
+
+    与 ``inverse_refined_mr_DRO``（I=0）的差异：各源独立 ``λ_k``；Wasserstein 项为
+    ``∑_k λ_k |·|``；聚合约束右端为 ``∑_k f_{k,α_k}``（无 ``w_k`` 系数）。
+
+    参数 ``empirical_distributions`` 的键须为 ``0,…,K−1``（与仓库中其它求解器一致）；
+    ``theta_k`` 须含每个键 ``k`` 的半径 ``θ_k``。
+    """
+    keys = sorted(empirical_distributions.keys())
+    K = len(keys)
+    if K < 1:
+        raise ValueError("至少需要 1 个经验分布")
+    arrs = [np.asarray(empirical_distributions[t], dtype=float) for t in keys]
+    D = int(arrs[0].shape[1])
+    if D < 1:
+        raise ValueError("维度 D 须至少为 1")
+    N: List[int] = []
+    for k, a in enumerate(arrs):
+        if len(a.shape) != 2 or int(a.shape[1]) != D:
+            raise ValueError(f"经验分布 k={keys[k]} 须为 (n_k, D) 且 D={D}")
+        N.append(int(a.shape[0]))
+        if N[-1] < 1:
+            raise ValueError(f"分布 k={keys[k]} 至少含一个样本点")
+
+    for k in keys:
+        if k not in theta_k:
+            raise ValueError(f"theta_k 须包含键 {k!r}")
+
+    Xi_n = _normalize_xi(Xi)
+    Xi_lower = {str(d): float(Xi_n[str(d)][0]) for d in range(1, D + 1)}
+    Xi_upper = {str(d): float(Xi_n[str(d)][1]) for d in range(1, D + 1)}
+
+    if eta_k_n is None:
+        eta_map = {keys[k]: np.ones(N[k], dtype=float) / N[k] for k in range(K)}
+    else:
+        eta_map = {}
+        for t in keys:
+            if t not in eta_k_n:
+                raise ValueError(f"提供 eta_k_n 时须包含每个键，缺少 {t!r}")
+            eta = np.asarray(eta_k_n[t], dtype=float).ravel()
+            if eta.size != int(empirical_distributions[t].shape[0]):
+                raise ValueError(f"eta_k_n[{t}] 长度须等于该分布样本数")
+            if not np.isclose(eta.sum(), 1.0, atol=1e-6):
+                raise ValueError(f"eta_k_n[{t}] 之和须为 1")
+            eta_map[t] = eta
+
+    # 重排为 0..K-1 下标以便与 alpha 元组对齐
+    emp_by_idx = {i: arrs[i] for i in range(K)}
+    eta_by_idx = {i: eta_map[keys[i]] for i in range(K)}
+    theta_by_idx = {i: float(theta_k[keys[i]]) for i in range(K)}
+
+    all_alpha = list(itertools_product(*[range(N[k]) for k in range(K)]))
+    T = K + 2
+
+    mdl = gp.Model("MultiRefL1Only")
+    mdl.setParam("OutputFlag", output_flag)
+
+    x_0 = {d: mdl.addVar(lb=0.0, name=f"x_0_{d}") for d in range(1, D + 1)}
+    lam = {i: mdl.addVar(lb=0.0, name=f"lambda_{i}") for i in range(K)}
+    f: Dict[int, Any] = {
+        i: mdl.addVars(N[i], lb=-GRB.INFINITY, name=f"f_{i}") for i in range(K)
+    }
+    omega: Dict[Tuple[Tuple[int, ...], int], Any] = {}
+    for alpha in all_alpha:
+        for d in range(1, D + 1):
+            omega[(alpha, d)] = mdl.addVar(lb=-GRB.INFINITY, name=f"omega_a{alpha}_d{d}")
+
+    terms = []
+    if obj_x0_linear is not None:
+        terms.append(
+            gp.quicksum(float(obj_x0_linear[d]) * x_0[d] for d in range(1, D + 1))
+        )
+    terms.append(
+        gp.quicksum(
+            gp.quicksum(float(eta_by_idx[k][n]) * f[k][n] for n in range(N[k])) for k in range(K)
+        )
+    )
+    terms.append(gp.quicksum(lam[k] * theta_by_idx[k] for k in range(K)))
+    mdl.setObjective(gp.quicksum(terms), GRB.MINIMIZE)
+
+    for constraint_idx, (A_row, b_val) in enumerate(zip(A_0, b_0)):
+        mdl.addConstr(
+            gp.quicksum(A_row[j] * x_0[j + 1] for j in range(D)) <= b_val,
+            name=f"retailer_feas_{constraint_idx}",
+        )
+
+    hat_zeta: Dict[Tuple[Tuple[int, ...], int, int], float] = {}
+    abs_diff: Dict[Tuple[Tuple[int, ...], int, int], List[float]] = {}
+
+    for alpha in all_alpha:
+        for t in range(1, T + 1):
+            for d in range(1, D + 1):
+                d_idx = d - 1
+                if t <= K:
+                    kk = t - 1
+                    n_t = alpha[kk]
+                    zv = float(emp_by_idx[kk][n_t, d_idx])
+                elif t == K + 1:
+                    zv = Xi_lower[str(d)]
+                else:
+                    zv = Xi_upper[str(d)]
+                key = (alpha, d, t)
+                hat_zeta[key] = zv
+                diffs = []
+                for kk in range(K):
+                    nk = alpha[kk]
+                    xik = float(emp_by_idx[kk][nk, d_idx])
+                    diffs.append(abs(zv - xik))
+                abs_diff[key] = diffs
+
+    y0: Dict[Tuple[Tuple[int, ...], int, int], Any] = {}
+    y0p: Dict[Tuple[Tuple[int, ...], int, int], Any] = {}
+    for alpha in all_alpha:
+        for t in range(1, T + 1):
+            for d in range(1, D + 1):
+                key = (alpha, d, t)
+                zv = hat_zeta[key]
+                y0[key] = mdl.addVar(lb=0.0, name=f"y0_a{alpha}_t{t}_d{d}")
+                y0p[key] = mdl.addVar(lb=0.0, name=f"y0p_a{alpha}_t{t}_d{d}")
+                mdl.addConstr(y0[key] >= zv - x_0[d], name=f"c_y0_{alpha}_{t}_{d}")
+                mdl.addConstr(y0p[key] >= x_0[d] - zv, name=f"c_y0p_{alpha}_{t}_{d}")
+
+    mdl.update()
+
+    for aidx, alpha in enumerate(all_alpha):
+        lhs = gp.quicksum(omega[(alpha, d)] for d in range(1, D + 1))
+        rhs = gp.quicksum(f[k][alpha[k]] for k in range(K))
+        mdl.addConstr(lhs <= rhs, name=f"omega_agg_{aidx}")
+
+    for aidx, alpha in enumerate(all_alpha):
+        for t in range(1, T + 1):
+            for d in range(1, D + 1):
+                key = (alpha, d, t)
+                b0 = float(b_0_coef[d])
+                h0 = float(h_0_coef[d])
+                lhs = (
+                    b0 * y0[key]
+                    + h0 * y0p[key]
+                    - gp.quicksum(lam[k] * abs_diff[key][k] for k in range(K))
+                )
+                mdl.addConstr(lhs <= omega[(alpha, d)], name=f"main_a{aidx}_t{t}_d{d}")
+
+    mdl.optimize()
+
+    if mdl.status == GRB.OPTIMAL:
+        ox0 = {d: x_0[d].X for d in range(1, D + 1)}
+        olam = {keys[k]: lam[k].X for k in range(K)}
+        of = {keys[k]: [f[k][n].X for n in range(N[k])] for k in range(K)}
+        return ox0, olam, of, float(mdl.ObjVal), mdl
+
+    print(f"警告：solve_multi_reference_l1_only 未求得最优解，状态码：{mdl.status}")
+    return None, None, None, float("nan"), mdl
 
 
 def _normalize_xi(Xi: Mapping) -> Dict[str, Sequence[float]]:
@@ -726,3 +1140,12 @@ if __name__ == "__main__":
         output_flag=0,
     )
     print("choosing theta K=0,I=1: theta*=", th_k0, "eps=", eps_k0, "obj=", obj_k0)
+
+    rng3 = np.random.default_rng(7)
+    D3 = 2
+    emp3 = {
+        0: rng3.uniform(8, 16, size=(3, D3)),
+        1: rng3.uniform(9, 17, size=(3, D3)),
+        2: rng3.uniform(7, 15, size=(3, D3)),
+    }
+
