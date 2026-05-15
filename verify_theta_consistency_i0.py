@@ -141,7 +141,7 @@ def main():
     w_k = np.array([0.4, 0.6])
     eta = {k: np.ones(N[k]) / N[k] for k in range(K)}
 
-    th_star, _eps, obj_ch, _m = model.solve_choosing_theta_epsilon(
+    th_star, _eps, obj_ch, _m, _snap = model.solve_choosing_theta_epsilon(
         K=K,
         I=0,
         D=D,
@@ -178,7 +178,7 @@ def main():
 
     # 额外：给定 choosing 里固定的 underline_theta，应有 theta* ≈ max(0, W_min - underline)
     ubar = 3.0
-    th2, _, _, _ = model.solve_choosing_theta_epsilon(
+    th2, _, _, _, _ = model.solve_choosing_theta_epsilon(
         K=K,
         I=0,
         D=D,

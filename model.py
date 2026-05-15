@@ -34,190 +34,152 @@ import gurobipy as gp
 from gurobipy import GRB, quicksum
 
 
-def _wasserstein1_barycenter_lp(
-    C: np.ndarray,
-    dists: List[np.ndarray],
-    w: np.ndarray,
-    output_flag: int,
-) -> Dict[str, Any]:
-    """在已知代价矩阵 C 上解加权 W_1 离散重心 LP（C[i,j]=c(i,j)）。"""
-    n = int(C.shape[0])
-    K = len(dists)
-    for k, p in enumerate(dists):
-        if p.shape != (n,):
-            raise ValueError(f"第 {k} 个概率向量长度须为 n={n}")
-        if not np.isclose(p.sum(), 1.0, atol=1e-6):
-            raise ValueError(f"第 {k} 个概率向量之和须为 1")
-        if (p < -1e-12).any():
-            raise ValueError(f"第 {k} 个概率向量须非负")
-
-    model = gp.Model("W1_Barycenter_K_Discrete")
-    model.setParam("OutputFlag", output_flag)
-
-    b = model.addVars(n, lb=0.0, name="barycenter")
-    Ts: List[Any] = []
+def _default_xi_from_empirical(
+    empirical_distributions: Mapping[int, np.ndarray],
+    K: int,
+    D: int,
+    floor_hi: float = 25.0,
+    margin: float = 1.25,
+) -> Dict[str, List[float]]:
+    """当未显式给出 Xi 时，由各源样本逐维上界构造盒约束（与 blood.build_Xi 思路一致，简化版）。"""
+    hi = np.zeros(D, dtype=float)
     for k in range(K):
-        Ts.append(model.addVars(n, n, lb=0.0, name=f"T_{k}"))
-
-    obj = quicksum(
-        float(w[k]) * quicksum(float(C[i, j]) * Ts[k][i, j] for i in range(n) for j in range(n))
-        for k in range(K)
-    )
-    model.setObjective(obj, GRB.MINIMIZE)
-
-    model.addConstr(quicksum(b[i] for i in range(n)) == 1, "barycenter_sum")
-
-    for i in range(n):
-        for k in range(K):
-            model.addConstr(quicksum(Ts[k][i, j] for j in range(n)) == b[i], f"T{k}_row_{i}")
-
-    for j in range(n):
-        for k in range(K):
-            model.addConstr(
-                quicksum(Ts[k][i, j] for i in range(n)) == float(dists[k][j]),
-                f"T{k}_col_{j}",
-            )
-
-    model.optimize()
-    if model.Status != GRB.OPTIMAL:
-        raise RuntimeError(f"W1 重心求解未得到最优解，Gurobi 状态码 {model.Status}")
-
-    bary = np.array([b[i].X for i in range(n)], dtype=float)
-    T_mats = tuple(
-        np.array([[Ts[k][i, j].X for j in range(n)] for i in range(n)], dtype=float)
-        for k in range(K)
-    )
-    w1_dists = np.array([float(np.sum(C * T_mats[k])) for k in range(K)], dtype=float)
+        a = np.asarray(empirical_distributions[k], dtype=float)
+        for d in range(D):
+            hi[d] = max(hi[d], float(np.max(a[:, d])))
     return {
-        "barycenter": bary,
-        "objective_value": float(model.ObjVal),
-        "transport_matrices": T_mats,
-        "wasserstein1_distances": w1_dists,
-        "n_points": n,
-        "K": K,
-        "weights": w.copy(),
+        str(d + 1): [0.0, float(max(floor_hi, hi[d] * margin + 2.0))] for d in range(D)
     }
 
 
-def _grid_row_key(row: np.ndarray, decimals: int = 10) -> Tuple[float, ...]:
-    return tuple(np.round(row, decimals))
+def _w1_l1_ot_cost(
+    locations_a: np.ndarray,
+    mass_a: np.ndarray,
+    locations_b: np.ndarray,
+    mass_b: np.ndarray,
+    output_flag: int,
+) -> float:
+    """离散分布间 L1 地面度量的 W_1（最优传输费用）。"""
+    na, nb = int(locations_a.shape[0]), int(locations_b.shape[0])
+    mass_a = np.asarray(mass_a, dtype=float).ravel()
+    mass_b = np.asarray(mass_b, dtype=float).ravel()
+    if na < 1 or nb < 1:
+        raise ValueError("支撑至少各含一个点")
+    if mass_a.size != na or mass_b.size != nb:
+        raise ValueError("质量向量长度与位置行数不一致")
+    if not np.isclose(mass_a.sum(), 1.0, atol=1e-7) or not np.isclose(mass_b.sum(), 1.0, atol=1e-7):
+        raise ValueError("两侧质量之和均须为 1")
+    C = np.abs(locations_a[:, None, :] - locations_b[None, :, :]).sum(axis=-1)
+    mdl = gp.Model("W1_OT_L1")
+    mdl.setParam("OutputFlag", output_flag)
+    x = mdl.addVars(na, nb, lb=0.0, name="pi")
+    mdl.setObjective(
+        quicksum(float(C[i, j]) * x[i, j] for i in range(na) for j in range(nb)),
+        GRB.MINIMIZE,
+    )
+    for i in range(na):
+        mdl.addConstr(quicksum(x[i, j] for j in range(nb)) == float(mass_a[i]), f"row_{i}")
+    for j in range(nb):
+        mdl.addConstr(quicksum(x[i, j] for i in range(na)) == float(mass_b[j]), f"col_{j}")
+    mdl.optimize()
+    if mdl.status != GRB.OPTIMAL:
+        raise RuntimeError(f"W_1 OT 子问题未最优，状态码 {mdl.status}")
+    return float(mdl.ObjVal)
 
 
-def _cartesian_product_grid_from_samples(
-    sample_arrays: List[np.ndarray],
-) -> Tuple[np.ndarray, List[np.ndarray]]:
+def _barycenter_from_beta_transport(
+    hat_zeta: Mapping[Tuple[Tuple[int, ...], int, int], float],
+    beta_sol: Mapping[Tuple[Tuple[int, ...], int, int], float],
+    gamma_sol: Mapping[Tuple[int, ...], float],
+    K: int,
+    I: int,
+    D: int,
+    N: Sequence[int],
+    eps_mass: float = 1e-14,
+) -> Tuple[np.ndarray, np.ndarray]:
     """
-    对每个维度 d，取所有样本在该维出现过的取值之并（唯一化），再作笛卡尔积作为网格行。
+    由 choosing 最优 β、γ 与 \\hat{ζ} 恢复 \\mathbb{R}^D 上离散质心。
+
+    对任意固定的参考源 k，β_{α,d,t} 表示从经验点 \\hat{ξ}_{k,α_k} 运往标量
+    \\hat{ζ}_{α,d,t} 的质量（``∑_t β_{α,d,t}=γ_α``）。
+    场景 α 上到达的 D 维落点取坐标加权平均
+    ``z_{α,d}=∑_t β_{α,d,t}\\hat{ζ}_{α,d,t}/γ_α``，质量为 ``γ_α``；
+    合并重复支撑后归一化为概率向量。
     """
-    if not sample_arrays:
-        raise ValueError("至少需要一组经验样本")
-    D = int(sample_arrays[0].shape[1])
-    if D < 1:
-        raise ValueError("维度 D 须至少为 1")
-    for a in sample_arrays:
-        if len(a.shape) != 2 or int(a.shape[1]) != D:
-            raise ValueError("各经验分布须为二维数组 (n_k, D) 且 D 一致")
-        if a.shape[0] < 1:
-            raise ValueError("每组经验分布至少含一个样本点")
-
-    per_dim: List[np.ndarray] = []
-    for d in range(D):
-        cols = [a[:, d] for a in sample_arrays]
-        per_dim.append(np.unique(np.concatenate(cols)))
-
-    grid_tuples = list(itertools_product(*[v.tolist() for v in per_dim]))
-    X = np.asarray(grid_tuples, dtype=float)
-    return X, per_dim
-
-
-def _embed_empirical_on_grid(
-    samples: np.ndarray,
-    X: np.ndarray,
-    row_masses: Optional[np.ndarray] = None,
-    decimals: int = 10,
-) -> np.ndarray:
-    """
-    将离散经验分布嵌入网格 X 上的概率向量：第 i 行样本携带质量 m_i，同网格点质量相加。
-
-    row_masses 为 None 时等价于 inverse_refined_mr_DRO 中 eta_k_n 缺省：m_i = 1/n_k。
-    """
-    n = X.shape[0]
-    idx_map = {_grid_row_key(X[i], decimals): i for i in range(n)}
-    p = np.zeros(n, dtype=float)
-    nk = int(samples.shape[0])
-    if row_masses is None:
-        m = np.ones(nk, dtype=float) / nk
-    else:
-        m = np.asarray(row_masses, dtype=float).ravel()
-        if m.size != nk:
-            raise ValueError(f"质量向量长度须等于样本行数 n_k={nk}，当前为 {m.size}")
-        if (m < -1e-12).any():
-            raise ValueError("样本质量须非负")
-        if not np.isclose(m.sum(), 1.0, atol=1e-6):
-            raise ValueError(f"样本质量之和须为 1，当前为 {m.sum():.6f}")
-
-    for i in range(nk):
-        row = samples[i]
-        mass = float(m[i])
-        key = _grid_row_key(row, decimals)
-        if key in idx_map:
-            p[idx_map[key]] += mass
+    Tloc = K + I + 2
+    all_alpha = list(itertools_product(*[range(N[k]) for k in range(K)]))
+    rows: List[np.ndarray] = []
+    masses: List[float] = []
+    for alpha in all_alpha:
+        g = float(gamma_sol.get(alpha, 0.0))
+        if g <= eps_mass:
             continue
-        matched = None
-        for j in range(n):
-            if np.allclose(X[j], row, rtol=0.0, atol=1e-8):
-                matched = j
-                break
-        if matched is None:
-            raise ValueError(
-                f"样本行无法匹配到积网格（请检查数值或是否由各维观测值生成）: {row!r}"
-            )
-        p[matched] += mass
-    return p
+        z = np.zeros(D, dtype=float)
+        for d in range(1, D + 1):
+            num = 0.0
+            for t in range(1, Tloc + 1):
+                b = float(beta_sol.get((alpha, d, t), 0.0))
+                num += b * float(hat_zeta[(alpha, d, t)])
+            z[d - 1] = num / g
+        rows.append(z)
+        masses.append(g)
+    if not rows:
+        raise RuntimeError("choosing 解未能恢复非空质心支撑（γ 全为 0？）")
+    Xmt = np.stack(rows, axis=0)
+    pm = np.asarray(masses, dtype=float)
+    pm = pm / float(pm.sum())
+    return _merge_duplicate_support_rows(Xmt, pm)
+
+
+def _merge_duplicate_support_rows(
+    X: np.ndarray,
+    p: np.ndarray,
+    decimals: int = 8,
+) -> Tuple[np.ndarray, np.ndarray]:
+    agg: Dict[Tuple[float, ...], float] = {}
+    for i in range(X.shape[0]):
+        key = tuple(np.round(X[i], decimals))
+        agg[key] = agg.get(key, 0.0) + float(p[i])
+    Xo = np.array([list(k) for k in agg], dtype=float)
+    po = np.array([agg[k] for k in agg], dtype=float)
+    s = float(po.sum())
+    if s <= 0.0:
+        raise ValueError("合并后总质量为 0")
+    po = po / s
+    return Xo, po
 
 
 def wasserstein1_barycenter_k_discrete(
     empirical_distributions: Mapping[int, np.ndarray],
     weights: Optional[Union[np.ndarray, Mapping[int, float]]] = None,
     eta_k_n: Optional[Mapping[int, np.ndarray]] = None,
+    Xi: Optional[Mapping] = None,
     output_flag: int = 0,
 ) -> Dict[str, Any]:
     """
-    在「各维支撑之并」的笛卡尔积网格上，求加权 1-Wasserstein（L1 地面度量）离散重心。
+    通过 ``solve_choosing_theta_epsilon``（I=0、θ̲=0）求解 Wasserstein 预算，并由最优
+    ``β_{α,d,t}`` 恢复离散质心。
 
-    输入为 inverse_refined_mr_DRO 风格的 ``{k: 样本矩阵 (n_k, D)}``；每个 k 上经验律取
-    样本行上的离散分布，再嵌入到公共网格：第 d 维取所有经验样本在该维出现过的值的集合
-    S_d，网格点为 ``S_1 × … × S_D``（与题设 (1,3),(2,4) → {(1,3),(1,4),(2,3),(2,4)} 一致）。
+    **β 的含义**（可任意固定参考源 k）：``β_{α,d,t}`` 表示从经验点
+    ``\\hat{ξ}_{k,α_k}`` 上将质量运往目标标量 ``\\hat{ζ}_{α,d,t}`` 的数量
+    （``∑_t β_{α,d,t}=γ_α``）。场景 α 的质心落点为
+    ``z_{α,d}=∑_t β_{α,d,t}\\hat{ζ}_{α,d,t}/γ_α``，质量 ``γ_α``，
+    见 ``_barycenter_from_beta_transport``。
 
-    **是否「精确」Wasserstein 重心？**
-    - 在 **全空间** \\mathbb{R}^D 上不限制支撑时，W_1 的 Fréchet 均值一般 **不是**
-      有限点集上的测度，更无法用该笛卡尔积 **精确** 表示；网格上的解是 **限制重心支撑在该积网格上**
-      时的 LP **精确最优**（对该离散化问题零对偶间隙意义下的精确）。
-    - 若问题本意就是「在所有网格点上选 b 使 sum_k w_k W_1(b, \\hat P_k) 最小」，则本构造给出该问题的精确解。
+    须给定盒约束 ``Xi``；为 ``None`` 时见 ``_default_xi_from_empirical``。
 
-    参数:
-        empirical_distributions: 键为 k、值为 (n_k, D) 的样本矩阵（与 inverse_refined_mr_DRO 一致）。
-        weights: 与 ``sorted(keys)`` 同序的长度 K 向量，或 ``{k: w_k}`` 字典（和为 1）；默认等权。
-        eta_k_n: 可选，与 inverse_refined_mr_DRO 中 ``eta_k_n`` 含义一致：``eta_k_n[k]`` 为长度 n_k、
-            非负且和为 1 的向量，``eta_k_n[k][i]`` 为第 k 个分布第 i 行样本的质量。
-            为 ``None`` 时退化为 ``np.ones(n_k) / n_k``（行等权）。
-            若传入字典，须对 ``sorted(empirical_distributions.keys())`` 中每个 k 都给出条目。
-        output_flag: Gurobi OutputFlag。
-
-    返回:
-        dict：含 ``X``（积网格 n×D）、``per_dimension_support``、``keys_order``、
-        ``barycenter``（与 X 行对齐）、``objective_value``、``transport_matrices``、
-        ``wasserstein1_distances``、``dimension``、``K``、``weights``。
-        网格点数 n = prod_d |S_d|，维数 D 大时指数级增长。
+    返回 ``objective_value`` 为 choosing 最优 θ；``wasserstein1_distances[k]`` 为恢复出的
+    离散质心 ``(X,b)`` 与各经验源 ``P_k`` 之间 L1 地面度量下的 OT ``W_1``。
+    另含 ``choosing_solution``（β、γ、\\hat{ζ} 等）及 ``wasserstein_linear_contrib``（模型线性项分解）。
     """
     keys = sorted(empirical_distributions.keys())
     K = len(keys)
     if K < 1:
         raise ValueError("至少需要 1 个经验分布")
 
-    arrs = [np.asarray(empirical_distributions[t], dtype=float) for t in keys]
-    X, per_dim = _cartesian_product_grid_from_samples(arrs)
-    n, D = int(X.shape[0]), int(X.shape[1])
+    emp_solve = {j: np.asarray(empirical_distributions[t], dtype=float) for j, t in enumerate(keys)}
+    D = int(next(iter(emp_solve.values())).shape[1])
+    N = [int(emp_solve[k].shape[0]) for k in range(K)]
 
     if weights is None:
         w = np.ones(K, dtype=float) / K
@@ -234,30 +196,73 @@ def wasserstein1_barycenter_k_discrete(
         if not np.isclose(w.sum(), 1.0, atol=1e-6):
             raise ValueError(f"权重之和须为 1，当前为 {w.sum():.6f}")
 
-    if eta_k_n is None:
-        row_weights_per_k: List[Optional[np.ndarray]] = [None] * K
-    else:
-        row_weights_per_k = []
-        for t in keys:
+    eta_ch: Optional[Dict[int, np.ndarray]] = None
+    if eta_k_n is not None:
+        eta_ch = {}
+        for j, t in enumerate(keys):
             if t not in eta_k_n:
-                raise ValueError(
-                    f"提供 eta_k_n 时须包含每个经验键 k 的质量向量，缺少键 {t!r}"
-                )
-            eta = np.asarray(eta_k_n[t], dtype=float)
-            row_weights_per_k.append(eta)
+                raise ValueError(f"提供 eta_k_n 时须包含每个经验键 k 的质量向量，缺少键 {t!r}")
+            eta_ch[j] = np.asarray(eta_k_n[t], dtype=float)
 
-    dist_vecs = [
-        _embed_empirical_on_grid(a, X, row_masses=rw)
-        for a, rw in zip(arrs, row_weights_per_k)
-    ]
-    C = np.abs(X[:, None, :] - X[None, :, :]).sum(axis=-1)
+    Xi_use = Xi if Xi is not None else _default_xi_from_empirical(emp_solve, K, D)
+    Xi_n = _normalize_xi(Xi_use)
 
-    out = _wasserstein1_barycenter_lp(C, dist_vecs, w, output_flag)
-    out["X"] = X
-    out["per_dimension_support"] = per_dim
-    out["keys_order"] = keys
-    out["dimension"] = D
-    return out
+    th_star, _eps, obj_val, _mdl, sol = solve_choosing_theta_epsilon(
+        K=K,
+        I=0,
+        D=D,
+        N=N,
+        mathcal_D={},
+        Xi=Xi_n,
+        empirical_distributions=emp_solve,
+        eta_k_n=eta_ch,
+        w_k=w,
+        theta_bar=0.0,
+        tau=1.0,
+        output_flag=output_flag,
+    )
+    if th_star is None or obj_val is None or sol is None:
+        raise RuntimeError("solve_choosing_theta_epsilon 未得到最优解，无法构造重心输出")
+
+    hat_z = sol["hat_zeta"]
+    beta_sol = sol["beta"]
+    gamma_sol = sol["gamma"]
+    abs_diff_sol = sol["abs_diff"]
+    X, b = _barycenter_from_beta_transport(hat_z, beta_sol, gamma_sol, K, 0, D, N)
+
+    w1_lin: List[float] = []
+    for kk in range(K):
+        sk = 0.0
+        for key, difs in abs_diff_sol.items():
+            sk += float(beta_sol.get(key, 0.0)) * float(difs[kk])
+        w1_lin.append(sk)
+    w1_lin_arr = np.asarray(w1_lin, dtype=float)
+
+    w1_list: List[float] = []
+    for kk in range(K):
+        Pk = np.asarray(emp_solve[kk], dtype=float)
+        if eta_ch is None:
+            pk = np.ones(N[kk], dtype=float) / N[kk]
+        else:
+            pk = np.asarray(eta_ch[kk], dtype=float).ravel()
+        w1_list.append(_w1_l1_ot_cost(X, b, Pk, pk, output_flag))
+    w1_dists = np.asarray(w1_list, dtype=float)
+
+    return {
+        "X": X,
+        "barycenter": b.astype(float),
+        "objective_value": float(obj_val),
+        "wasserstein1_distances": w1_dists,
+        "wasserstein_linear_contrib": w1_lin_arr,
+        "transport_matrices": (),
+        "n_points": int(X.shape[0]),
+        "K": K,
+        "weights": w.copy(),
+        "keys_order": keys,
+        "dimension": D,
+        "per_dimension_support": [],
+        "choosing_solution": sol,
+    }
 
 
 def solve_multi_reference_l1_only(
@@ -764,6 +769,7 @@ def solve_choosing_theta_epsilon(
     Optional[Dict[int, float]],
     Optional[float],
     Any,
+    Optional[Dict[str, Any]],
 ]:
     """
     根据文中「选择参数」模型的对偶 LP（式 choosing parameter）求解
@@ -784,6 +790,11 @@ def solve_choosing_theta_epsilon(
         ∑_{d,t} β_{(),d,t} = k0_beta_mass 固定质量标度（默认 1），否则尺度不定。
 
     参数 k0_beta_mass 仅在 K = 0 时使用。
+
+    返回:
+      ``(theta*, ε 或 None, objective, gurobi_model, choosing_snapshot 或 None)``。
+      求得最优解时第五项为字典，含 ``beta``、``gamma``、``hat_zeta``（数值化）、以及 ``K,I,D,N`` 等元数据；
+      未最优时为 ``None``。
     """
     if order_data is None:
         order_data = {}
@@ -1052,10 +1063,39 @@ def solve_choosing_theta_epsilon(
 
     if mdl.status == GRB.OPTIMAL:
         o_eps = {i: eps_vars[i].X for i in range(1, I + 1)} if I > 0 else {}
-        return theta.X, o_eps if I > 0 else None, float(mdl.ObjVal), mdl
+        beta_sol: Dict[Tuple[Tuple[int, ...], int, int], float] = {
+            key: float(beta[key].X) for key in beta
+        }
+        gamma_sol: Dict[Tuple[int, ...], float] = {
+            alpha: float(gamma[alpha].X) for alpha in all_alpha
+        }
+        hat_z_sol = {k: float(v) for k, v in hat_zeta.items()}
+        abs_diff_sol: Dict[Tuple[Tuple[int, ...], int, int], List[float]] = {
+            k: [float(vv) for vv in v] for k, v in abs_diff.items()
+        }
+        choosing_sol: Dict[str, Any] = {
+            "beta": beta_sol,
+            "gamma": gamma_sol,
+            "hat_zeta": hat_z_sol,
+            "abs_diff": abs_diff_sol,
+            "K": K,
+            "I": I,
+            "D": D,
+            "N": list(N),
+            "w_k": np.asarray(w_k, dtype=float).copy() if K > 0 else np.array([]),
+            "theta_bar": float(theta_bar),
+            "tau": float(tau),
+        }
+        return (
+            float(theta.X),
+            o_eps if I > 0 else None,
+            float(mdl.ObjVal),
+            mdl,
+            choosing_sol,
+        )
 
     print(f"警告：solve_choosing_theta_epsilon 未求得最优解，状态码：{mdl.status}")
-    return None, None, None, mdl
+    return None, None, None, mdl, None
 
 
 if __name__ == "__main__":
@@ -1092,7 +1132,7 @@ if __name__ == "__main__":
     )
     print("smoke I=0,K=1 obj:", res[5], "lambda:", res[3])
 
-    th0, _, obj0, _ = solve_choosing_theta_epsilon(
+    th0, _, obj0, _, _ = solve_choosing_theta_epsilon(
         K=K_,
         I=0,
         D=D_,
@@ -1106,7 +1146,7 @@ if __name__ == "__main__":
     )
     print("choosing theta I=0: theta*=", th0, "obj=", obj0)
 
-    th_b, _, obj_b, _ = solve_choosing_theta_epsilon(
+    th_b, _, obj_b, _, _ = solve_choosing_theta_epsilon(
         K=2,
         I=0,
         D=D_,
@@ -1123,7 +1163,7 @@ if __name__ == "__main__":
     )
     print("choosing theta I=0 barycenter K=2 (theta_bar=0): theta*=", th_b, "obj=", obj_b)
 
-    th_k0, eps_k0, obj_k0, _ = solve_choosing_theta_epsilon(
+    th_k0, eps_k0, obj_k0, _, _ = solve_choosing_theta_epsilon(
         K=0,
         I=1,
         D=D_,
