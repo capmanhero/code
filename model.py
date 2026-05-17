@@ -26,12 +26,19 @@ s.t. (x_i, μ_i) ∈ \\bar{X}_i, λ ≥ 0, f, ω_{α,d}，
 
 from __future__ import annotations
 
+import math
 from itertools import product as itertools_product
 from typing import Any, Dict, List, Mapping, Optional, Sequence, Tuple, Union
 
 import numpy as np
 import gurobipy as gp
 from gurobipy import GRB, quicksum
+
+
+def _ceil_decimals(x: float, decimals: int = 4) -> float:
+    """保留 ``decimals`` 位小数并向上取整，如 3.141512 → 3.1416。"""
+    scale = 10**decimals
+    return math.ceil(float(x) * scale - 1e-12) / scale
 
 
 def _default_xi_from_empirical(
@@ -763,6 +770,7 @@ def solve_choosing_theta_epsilon(
     tau: float = 1.0,
     epsilon_norm: str = "l1",
     k0_beta_mass: float = 1.0,
+    epsilon_i_fixed: Optional[Mapping[int, float]] = None,
     output_flag: int = 0,
 ) -> Tuple[
     Optional[float],
@@ -791,13 +799,18 @@ def solve_choosing_theta_epsilon(
 
     参数 k0_beta_mass 仅在 K = 0 时使用。
 
+    参数 ``epsilon_i_fixed``：若给定，则将对应 ``ε_i`` 固定为该常数（仅优化其余变量与 θ）。
+
     返回:
       ``(theta*, ε 或 None, objective, gurobi_model, choosing_snapshot 或 None)``。
+      ``theta*`` 与各 ``ε_i`` 在返回前保留 4 位小数并向上取整。
       求得最优解时第五项为字典，含 ``beta``、``gamma``、``hat_zeta``（数值化）、以及 ``K,I,D,N`` 等元数据；
       未最优时为 ``None``。
     """
     if order_data is None:
         order_data = {}
+    if epsilon_i_fixed is not None:
+        epsilon_i_fixed = {int(i): float(v) for i, v in epsilon_i_fixed.items()}
 
     if K < 0 or I < 0:
         raise ValueError("K,I 必须非负")
@@ -894,7 +907,11 @@ def solve_choosing_theta_epsilon(
     eps_vars: Dict[int, Any] = {}
     if I > 0:
         for i in range(1, I + 1):
-            eps_vars[i] = mdl.addVar(lb=0.0, name=f"eps_{i}")
+            if epsilon_i_fixed is not None and i in epsilon_i_fixed:
+                ev = float(epsilon_i_fixed[i])
+                eps_vars[i] = mdl.addVar(lb=ev, ub=ev, name=f"eps_{i}")
+            else:
+                eps_vars[i] = mdl.addVar(lb=0.0, name=f"eps_{i}")
 
     if epsilon_norm == "l1":
         if I > 0:
@@ -1062,7 +1079,10 @@ def solve_choosing_theta_epsilon(
     mdl.optimize()
 
     if mdl.status == GRB.OPTIMAL:
-        o_eps = {i: eps_vars[i].X for i in range(1, I + 1)} if I > 0 else {}
+        th_out = _ceil_decimals(theta.X)
+        o_eps = (
+            {i: _ceil_decimals(eps_vars[i].X) for i in range(1, I + 1)} if I > 0 else {}
+        )
         beta_sol: Dict[Tuple[Tuple[int, ...], int, int], float] = {
             key: float(beta[key].X) for key in beta
         }
@@ -1087,7 +1107,7 @@ def solve_choosing_theta_epsilon(
             "tau": float(tau),
         }
         return (
-            float(theta.X),
+            th_out,
             o_eps if I > 0 else None,
             float(mdl.ObjVal),
             mdl,
