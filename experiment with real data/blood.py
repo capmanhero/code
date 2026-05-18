@@ -54,7 +54,7 @@ D = len(COLS)
 MONTHS_TRAIN = tuple(range(1, 11))  # 1..10
 MONTH_VAL = 11
 MONTH_TEST = 12
-N_BOOT = int(os.environ.get("BLOOD_N_BOOT", "10"))
+N_BOOT = 1
 N_SCEN = 10  # 每源训练场景数
 B0, H0 = 3.0, 1.0
 BI, HI = 4.0, 1.0
@@ -919,7 +919,7 @@ def run_one_target(
 
 
 def main() -> None:
-    out_path = pathlib.Path(__file__).resolve().parent / "blood_experiment_results.xlsx"
+    out_path = pathlib.Path(__file__).resolve().parent / f"blood_experiment_results_seed={seed_}.xlsx"
     all_detail: List[Dict[str, Any]] = []
     for target in ("CL", "ET"):
         for rep, seed in enumerate(RNG_SEEDS):
