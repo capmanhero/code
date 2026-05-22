@@ -272,7 +272,7 @@ def wasserstein1_barycenter_k_discrete(
     }
 
 
-def solve_multi_reference_l1_only(
+def solve_multi_reference_intersection(
     empirical_distributions: Mapping[int, np.ndarray],
     theta_k: Mapping[int, float],
     Xi: Mapping,
@@ -291,8 +291,6 @@ def solve_multi_reference_l1_only(
     Any,
 ]:
     """
-    推论 ``coro:finite convex reduction--multi_references_l1``（仅多源经验、L1 地面度量）：
-
         inf  ∑_{k,n} η_{k,n} f_{k,n} + ∑_{k} λ_k θ_k
         s.t. λ_k ≥ 0, f_{k,n}, ω_{α,d} ∈ ℝ,
              ∑_d ω_{α,d} ≤ ∑_{k} f_{k,α_k}   ∀α ∈ A = ∏_k [N_k],
@@ -357,7 +355,7 @@ def solve_multi_reference_l1_only(
     all_alpha = list(itertools_product(*[range(N[k]) for k in range(K)]))
     T = K + 2
 
-    mdl = gp.Model("MultiRefL1Only")
+    mdl = gp.Model("MultiRefIntersection") # 多源经验交集
     mdl.setParam("OutputFlag", output_flag)
 
     x_0 = {d: mdl.addVar(lb=0.0, name=f"x_0_{d}") for d in range(1, D + 1)}
@@ -453,7 +451,7 @@ def solve_multi_reference_l1_only(
         of = {keys[k]: [f[k][n].X for n in range(N[k])] for k in range(K)}
         return ox0, olam, of, float(mdl.ObjVal), mdl
 
-    print(f"警告：solve_multi_reference_l1_only 未求得最优解，状态码：{mdl.status}")
+    print(f"警告：solve_multi_reference_intersection 未求得最优解，状态码：{mdl.status}") 
     return None, None, None, float("nan"), mdl
 
 

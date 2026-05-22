@@ -54,13 +54,13 @@ D = len(COLS)
 MONTHS_TRAIN = tuple(range(1, 11))  # 1..10
 MONTH_VAL = 11
 MONTH_TEST = 12
-N_BOOT = 1
-N_SCEN = 10  # 每源训练场景数
-B0, H0 = 3.0, 1.0
-BI, HI = 4.0, 1.0
-CAP = 15.0
+N_BOOT = 10
+N_SCEN = 5  # 每源训练场景数
+B0, H0 = 4.0, 1.0
+BI, HI = 1.0, 4.0
+CAP = 20.0
 # ``mr_DRO_with_order``（I=1）超参网格：``epsilon_1`` 与加在逐日 θ 锚点上的 ``theta`` 偏移
-EPSILON_I_GRID = (0.0, 1.0, 3.0, 5.0)
+EPSILON_I_GRID = (0.0, 1.0, 3.0, 5.0, 8.0)
 THETA_HP_GRID = np.array([0.0, 0.01, 0.05, 0.1, 0.5, 1.0], dtype=float)
 # 其它方法：``theta = max(th_ch, bary_obj) + δ``；multi-ref：``theta_k = W_1(重心,P_k) + δ``
 THETA_DELTA_OFFSETS = THETA_HP_GRID
@@ -69,7 +69,7 @@ THREE_SOURCE_W_SELF_GRID = np.array([1.0 / 3.0, 1.0 / 2.0, 2.0 / 3.0], dtype=flo
 W_MODE_EQUAL = "equal"
 W_MODE_VAL_W_SELECTED = "val_w_selected"
 W_MODE_NA = "-"
-seed_ = 24
+seed_ = 100
 RNG_SEEDS = tuple(range(seed_, seed_ + max(N_BOOT, 1)))
 
 
@@ -376,7 +376,7 @@ def solve_inverse_k1(
     return x0, float(obj)
 
 
-def solve_multi_l1(
+def solve_intersection(
     emp: Mapping[int, np.ndarray],
     Xi: Mapping,
     theta_offset: float,
@@ -390,7 +390,7 @@ def solve_multi_l1(
         int(k): float(base_theta_k[int(k)]) + float(theta_offset)
         for k in sorted(base_theta_k.keys())
     }
-    ox0, _, _, obj, mdl = model.solve_multi_reference_l1_only(
+    ox0, _, _, obj, mdl = model.solve_multi_reference_intersection(
         empirical_distributions=emp,
         theta_k=tk,
         Xi=Xi,
@@ -453,7 +453,7 @@ def choosing_theta_i1_anchor(
         epsilon_i_fixed={1: float(epsilon_1)},
         output_flag=output_flag,
     )
-    return float(th) if th is not None else 1.0
+    return float(th)
 
 
 def eval_mr_dro_i1_fixed_hyperparams(
@@ -489,8 +489,8 @@ def eval_mr_dro_i1_fixed_hyperparams(
         x0, _ = solve_inverse_i1(
             emp, Xi, ord_t, th_solve, 0.0, w_k, eps, output_flag
         )
-        if x0 is None:
-            continue
+        # if x0 is None:
+        #     continue
         costs.append(oos_cost_station(Z[t], x0))
         x0_sums.append(float(sum(x0[d] for d in range(1, D + 1))))
     if not costs:
@@ -608,8 +608,8 @@ def _run_three_source_pack(
         tau=1.0,
         output_flag=output_flag,
     )
-    if th_star is None:
-        th_star = 1.0
+    # if th_star is None:
+    #     th_star = 1.0
 
     bary_out, _ = wasserstein_bary_exact(emp, Xi=Xi, weights=w_dict, output_flag=output_flag)
     print(
@@ -617,9 +617,9 @@ def _run_three_source_pack(
         f"support_n={bary_out['X'].shape[0]}, objective={bary_out.get('objective_value')}",
         flush=True,
     )
-    bary_B = float(bary_out.get("objective_value", 0.0) or 0.0)
+    bary_B = float(bary_out.get("objective_value"))
     base_theta_multi = theta_k_base_from_barycenter(bary_out)
-    thetas = theta_grid_from_anchors(float(th_star), bary_B)
+    thetas = theta_grid_from_anchors(float(th_star), 0)
 
     def inv0(t: float):
         return solve_inverse_i0(emp, Xi, t, 0.0, w_k, output_flag)
@@ -645,23 +645,20 @@ def _run_three_source_pack(
         b_I_i1,
         output_flag,
     )
-    if math.isfinite(best_eps_i1) and math.isfinite(best_theta_i1):
-        test_i1, n_test_ok, test_x0_sum = eval_mr_dro_i1_fixed_hyperparams(
-            emp,
-            Xi,
-            test_Z,
-            test_H,
-            w_k,
-            best_eps_i1,
-            best_theta_i1,
-            bi_i1,
-            hi_i1,
-            A_I_i1,
-            b_I_i1,
-            output_flag,
-        )
-    else:
-        test_i1, n_test_ok, test_x0_sum = float("nan"), 0, float("nan")
+    test_i1, n_test_ok, test_x0_sum = eval_mr_dro_i1_fixed_hyperparams(
+        emp,
+        Xi,
+        test_Z,
+        test_H,
+        w_k,
+        best_eps_i1,
+        best_theta_i1,
+        bi_i1,
+        hi_i1,
+        A_I_i1,
+        b_I_i1,
+        output_flag,
+    )
     hp_i1 = {
         "epsilon_1": best_eps_i1,
         "theta": best_theta_i1,
@@ -675,10 +672,10 @@ def _run_three_source_pack(
         "w_k": list(wlist),
     }
 
-    def ml1_wrap(t: float):
-        return solve_multi_l1(emp, Xi, float(t), base_theta_multi, output_flag)
+    def intersection_wrap(t: float):
+        return solve_intersection(emp, Xi, float(t), base_theta_multi, output_flag)
 
-    x0_m, vm_m, delta_sel = grid_search_val(ml1_wrap, val_Z, THETA_DELTA_OFFSETS)
+    x0_m, vm_m, delta_sel = grid_search_val(intersection_wrap, val_Z, THETA_DELTA_OFFSETS)
     tk_sel = (
         {int(k): float(base_theta_multi[k]) + float(delta_sel) for k in sorted(base_theta_multi)}
         if x0_m is not None
@@ -694,23 +691,10 @@ def _run_three_source_pack(
     }
 
     Xb, pb = prune_bary_to_inverse(bary_out)
-    thb, _, _, _, _ = model.solve_choosing_theta_epsilon(
-        K=1,
-        I=0,
-        D=D,
-        N=[Xb.shape[0]],
-        mathcal_D={},
-        Xi=Xi,
-        empirical_distributions={0: Xb},
-        w_k=None,
-        eta_k_n={0: pb},
-        theta_bar=0.0,
-        tau=1.0,
-        output_flag=output_flag,
-    )
-    if thb is None:
-        thb = 1.0
-    thetas_b = theta_grid_from_anchors(float(thb), bary_B)
+    thb = 0
+    # if thb is None:
+    #     thb = 1.0
+    thetas_b = theta_grid_from_anchors(float(thb), 0)
 
     def inv_bary(t: float):
         return solve_inverse_k1(Xb, Xi, t, 0.0, pb, output_flag)
@@ -862,8 +846,8 @@ def run_one_target(
         tau=1.0,
         output_flag=output_flag,
     )
-    if th1_star is None:
-        th1_star = 1.0
+    # if th1_star is None:
+    #     th1_star = 1.0
     thetas1 = theta_grid_from_anchors(float(th1_star), float(th1_star))
 
     def inv_val(t: float):
